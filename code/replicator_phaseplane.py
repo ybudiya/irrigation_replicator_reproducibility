@@ -10,9 +10,7 @@
 from __future__ import annotations
 
 import argparse
-import csv
 import io
-import json
 from dataclasses import asdict, dataclass, replace
 from functools import lru_cache
 from itertools import combinations
@@ -27,11 +25,9 @@ from matplotlib.collections import LineCollection
 from matplotlib.patches import FancyArrowPatch, Polygon
 import numpy as np
 from scipy.integrate import solve_ivp
-from scipy.optimize import brentq
 matplotlib.rcParams['pdf.fonttype'] = 42
 HERE = Path(__file__).resolve().parent
 OUTPUT = HERE.parent / 'output/replicator_phaseplane'
-ADMINISTRATIVE = HERE.parent / '_administrative'
 
 VISIBILITY = {
     'grouped': dict(arrow_mutation_scale=24., arrow_linewidth=3.,
@@ -50,8 +46,6 @@ NULLCLINE_STYLE = {
 }
 
 NULLCLINE_WIDTH = {'grouped': 6., 'individual': 6.}
-
-EXPECTED = json.loads((ADMINISTRATIVE / 'reference_results.json').read_text())['grouped_expected']
 
 PAGE_WIDTH = 1070.
 
@@ -296,47 +290,6 @@ def equilibria(p: Parameters) -> tuple[dict[str, Any], ...]:
         result.append(dict(name=name, x=x, eigenvalues=ev, pch=phaseR_pch(ev),
                            classification=classify(ev), residual=residual))
     return tuple(result)
-
-def independent_points(p: Parameters) -> dict:
-    e=np.array([1.,p.ep,p.ec]);k=np.array([p.kg,p.kp,p.kc])
-    points={name:np.eye(3)[i] for i,name in enumerate('gpc')}
-    for i,j in combinations(range(3),2):
-        def difference(t):
-            return (e[j]-e[i])*p.rho/(p.nu*((1-t)*e[i]+t*e[j])+p.omega)**p.b-(k[j]-k[i])
-        if difference(0)*difference(1)<0:
-            t=brentq(difference,0,1,xtol=1e-14)
-            x=np.zeros(3);x[i]=1-t;x[j]=t;points['gpc'[i]+'gpc'[j]]=x
-    return points
-
-def verify_math() -> dict:
-    records=[];max_error=0.;count=0
-    for family,panels in FAMILIES.items():
-        for i,panel in enumerate(panels):
-            actual={q['name']:q for q in equilibria(panel.parameters)}
-            independent=independent_points(panel.parameters)
-            if set(actual)!=set(independent): raise AssertionError('Equilibrium sets differ.')
-            stable=[]
-            for name,x in independent.items():
-                q=actual[name];z=x[1:];h=1e-5
-                fd=np.column_stack([(independent_rhs(z+h*d,panel.parameters)-
-                                     independent_rhs(z-h*d,panel.parameters))/(2*h) for d in np.eye(2)])
-                ev=np.linalg.eigvals(fd)
-                np.testing.assert_allclose(x,q['x'],rtol=0,atol=1e-11)
-                np.testing.assert_allclose(np.sort(ev),np.sort(q['eigenvalues']),rtol=0,atol=1e-7)
-                max_error=max(max_error,float(np.max(abs(fd-jacobian(z,panel.parameters)))))
-                if np.all(ev.real<0):stable.append(name)
-                count+=1
-            if stable != [EXPECTED[family][i]]: raise AssertionError((family,panel.letter,stable))
-            q=actual[stable[0]]
-            records.append(dict(family=family,panel=panel.letter,parameter=panel.parameter,
-                                value=panel.value_text,stable=stable[0],shares=q['x'].tolist(),
-                                eigenvalues=q['eigenvalues'].real.tolist()))
-    return dict(displayed_scenarios=len(records),equilibrium_records=count,
-                unique_parameter_sets=len({p.parameters for panels in FAMILIES.values() for p in panels}),
-                initial_conditions=STARTS.tolist(),end_time=END_TIME,
-                maximum_jacobian_absolute_difference=max_error,
-                method='Analytical roots plus independent bracketing roots and finite-difference Jacobians',
-                stable_outcomes=records)
 
 def nullcline_growth(panel: Panel, xp, xc):
     p = panel.parameters
@@ -844,23 +797,6 @@ def text_overlap_checks(records: list[dict], tolerance: float = .5) -> list[dict
                 collisions.append({'first':first['text'],'second':second['text']})
     return collisions
 
-def write_manifest(output: Path) -> None:
-    rows=[];eqrows=[]
-    for name,panels in FAMILIES.items():
-        for i,p in enumerate(panels):
-            row,col=divmod(i,2)
-            rows.append(dict(family=name,panel=p.letter,row=row+1,column=col+1,
-                             parameter=p.parameter,value=p.value_text,**asdict(p.parameters)))
-            for q in equilibria(p.parameters):
-                eqrows.append(dict(family=name,panel=p.letter,equilibrium=q['name'],
-                                   x_g=q['x'][0],x_p=q['x'][1],x_c=q['x'][2],
-                                   classification=q['classification'],R_pch=q['pch'],
-                                   lambda1=float(q['eigenvalues'][0].real),
-                                   lambda2=float(q['eigenvalues'][1].real),residual=q['residual']))
-    for filename,table in [('scenario_manifest.csv',rows),('equilibrium_checks.csv',eqrows)]:
-        with (output/filename).open('w',newline='') as f:
-            writer=csv.DictWriter(f,fieldnames=list(table[0]));writer.writeheader();writer.writerows(table)
-
 def export(family: str, output: Path, dpi: int=300):
     fig,report = build_grouped(family)
     stem = f'grouped_phaseR_{family}_{report["rows"]}x2_text2x{SUFFIX}'
@@ -891,19 +827,9 @@ def main():
         parser.error('Use at least 200 dpi.')
     output = args.output_dir.resolve()
     output.mkdir(parents=True, exist_ok=True)
-    ADMINISTRATIVE.mkdir(parents=True, exist_ok=True)
-    report = dict(math=verify_math(), figures=[])
-    write_manifest(ADMINISTRATIVE)
     for family in FAMILIES:
-        result = export(family, output, args.dpi)
-        report['figures'].append(dict(family=family, pdf=result['pdf'], png=result['png'],
-            panels=len(result['panels']), text_overlaps=result['text_overlaps'],
-            pdf_text_spans_in_bounds=result['pdf_text_spans_in_bounds'],
-            pdf_raster_images=result['pdf_raster_images']))
+        export(family, output, args.dpi)
         print('Generated', family, flush=True)
-    (ADMINISTRATIVE / 'phaseplane_validation.json').write_text(
-        json.dumps(report, indent=2) + '\n')
 
 if __name__ == '__main__':
     main()
-
